@@ -431,10 +431,9 @@ export function readPack(pack: Buffer, external: (oid: string) => GitObject | un
       baseOid = pack.subarray(offset, offset + 20).toString("hex");
       offset += 20;
     }
-    const streamEnd = findStreamEnd(pack, offset, end, size);
-    const inflated = inflateSync(pack.subarray(offset, streamEnd));
-    offset = streamEnd;
-    const raw = inflated.subarray(0, size);
+    const entry = inflateEntry(pack, offset, end, size);
+    offset = entry.next;
+    const raw = entry.data;
     if (typeCode === 6) pending.push({ type: "ofs-delta", data: Buffer.from(raw), baseOffset, offset: entryOffset });
     else if (typeCode === 7) pending.push({ type: "ref-delta", data: Buffer.from(raw), baseOid, offset: entryOffset });
     else {
@@ -472,33 +471,47 @@ function byOffsetByOid(byOffset: Map<number, GitObject>, oid: string): GitObject
   return undefined;
 }
 
-/**
- * Find the offset just past the zlib stream starting at `start`, knowing it inflates
- * to exactly `size` bytes. Streams written by zlib's deflateSync are self-terminating;
- * we probe growing windows and accept the first whose inflate succeeds with the exact
- * output length. Windows grow exponentially, then binary-search down.
- */
-function findStreamEnd(pack: Buffer, start: number, end: number, size: number): number {
-  let lo = start + 1;
-  let hi = Math.min(end, start + 2);
-  const inflates = (upto: number): boolean => {
-    try {
-      return inflateSync(pack.subarray(start, upto)).length === size;
-    } catch {
-      return false;
+/** Adler-32 of a buffer (the zlib stream trailer), computed in the standard blocks. */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let index = 0;
+  while (index < data.length) {
+    const block = Math.min(5552, data.length - index);
+    for (let i = 0; i < block; i++) {
+      a += data[index++];
+      b += a;
     }
-  };
-  while (!inflates(hi)) {
-    lo = hi;
-    hi = Math.min(end, start + (hi - start) * 2);
-    if (hi === lo) throw new Error("pack entry stream does not terminate");
+    a %= MOD;
+    b %= MOD;
   }
-  while (lo + 1 < hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    if (inflates(mid)) hi = mid;
-    else lo = mid;
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Inflate the zlib stream starting at `start` and find where it ends.
+ * inflateSync tolerates trailing bytes and returns exactly the first stream's
+ * output, so inflate once to learn the object, then locate the stream's
+ * Adler-32 trailer and verify each candidate position with one exact inflate.
+ */
+function inflateEntry(pack: Buffer, start: number, end: number, size: number): { data: Buffer; next: number } {
+  const data = inflateSync(pack.subarray(start, end));
+  if (data.length !== size) throw new Error("pack entry inflates to the wrong size");
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let from = start + 2;
+  for (;;) {
+    const idx = pack.indexOf(needle, from);
+    if (idx === -1 || idx + 4 > end) throw new Error("pack entry stream does not terminate");
+    try {
+      const check = inflateSync(pack.subarray(start, idx + 4));
+      if (check.length === size && check.equals(data)) return { data, next: idx + 4 };
+    } catch {
+      // A false Adler candidate inside the compressed bytes; keep scanning.
+    }
+    from = idx + 1;
   }
-  return hi;
 }
 
 // ---------------------------------------------------------------------------
@@ -567,12 +580,14 @@ export function decodePkts(buffer: Buffer): ParsedPkt[] {
   return out;
 }
 
-/** Sideband-wrap a payload: split into <=65520-byte band-1 packets (plus optional progress). */
+/** Sideband-wrap a payload: split into <=65515-byte band-1 packets (plus optional progress).
+ *  A pkt-line is at most 65520 bytes on the wire including its 4-byte header, so a
+ *  sideband packet carries at most 65516 payload bytes, one of which is the band. */
 export function sidebandWrap(data: Buffer, progress?: string): Buffer {
   const parts: Buffer[] = [];
   if (progress) parts.push(pktLine(Buffer.concat([Buffer.from([2]), Buffer.from(progress, "utf8")])));
-  for (let offset = 0; offset < data.length; offset += 65520) {
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), data.subarray(offset, offset + 65520)])));
+  for (let offset = 0; offset < data.length; offset += 65515) {
+    parts.push(pktLine(Buffer.concat([Buffer.from([1]), data.subarray(offset, offset + 65515)])));
   }
   if (data.length === 0) parts.push(pktLine(Buffer.from([1])));
   return Buffer.concat(parts);

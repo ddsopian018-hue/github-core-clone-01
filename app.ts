@@ -2,8 +2,9 @@
 // under /api/v3, GraphQL at /api/graphql, MCP at /mcp, and git smart HTTP at
 // /<owner>/<repo>.git/... — all over one shared Forge store.
 //
-// Kept from the kit starter: the exported createForge(options?) shape that
-// main.ts drives. Everything behind it is the implementation.
+// Kept from the kit starter: the exported createApp() shape that main.ts
+// drives (no arguments; the token comes from $MAKEFUN_SHOP_TOKEN).
+// Everything behind it is the implementation.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Forge } from "./forge.ts";
@@ -30,7 +31,7 @@ function protocolVersion(req: IncomingMessage): number {
   return /(?:^|,)version=2(?:,|$)/.test(value.replace(/\s/g, "")) || value.includes("version=2") ? 2 : 0;
 }
 
-export function createForge(options: ForgeOptions = {}): Server {
+export function createApp(options: ForgeOptions = {}): Server {
   const token = options.token ?? process.env.MAKEFUN_SHOP_TOKEN ?? DEFAULT_TOKEN;
   const forge = new Forge();
 
@@ -42,6 +43,9 @@ export function createForge(options: ForgeOptions = {}): Server {
   });
   return server;
 }
+
+/** Alias kept for local tooling. */
+export const createForge = createApp;
 
 async function handle(forge: Forge, token: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");

@@ -183,7 +183,7 @@ export class Forge {
       parents: parent ? [parent] : [],
       author: ident,
       committer: ident,
-      message: message.endsWith("\n") ? message : `${message}\n`,
+      message,
     });
     return this.store.put("commit", commit);
   }
@@ -260,7 +260,7 @@ export class Forge {
     return { status: 200, commitSha };
   }
 
-  createIssue(repo: Repo, title: string, body: string, labels: string[]): Issue {
+  createIssue(repo: Repo, title: string, body: string, labels: string[] = []): Issue {
     const now = Date.now();
     const issue: Issue = {
       number: repo.nextNumber++,

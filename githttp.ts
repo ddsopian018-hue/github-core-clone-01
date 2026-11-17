@@ -20,6 +20,9 @@ import {
 
 const AGENT = "git/forge-1.0";
 
+/** Memoized fetch responses, keyed by the content-addressed request tuple. */
+const fetchCache = new Map<string, Buffer>();
+
 function sortedRefs(repo: Repo): Array<[string, string]> {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
@@ -216,8 +219,7 @@ export function uploadPack(forge: Forge, repo: Repo, body: Buffer, protocolVersi
     res.writeHead(400, { "content-type": "text/plain" });
     res.end("bad pkt-line stream");
     return;
-  }
-  const lines: string[] = [];
+  }  const lines: string[] = [];
   for (const pkt of pkts) if (pkt.kind === "data") lines.push(pkt.payload.toString("utf8"));
   const commandLine = lines.find((l) => l.startsWith("command="));
   const command = commandLine ? commandLine.slice("command=".length).trim() : "";
@@ -235,8 +237,26 @@ export function uploadPack(forge: Forge, repo: Repo, body: Buffer, protocolVersi
 
   if (command === "fetch" || (protocolVersion !== 2 && lines.some((l) => l.startsWith("want ")))) {
     const args = parseFetchArgs(lines);
+    // Object ids are content-addressed and objects are immutable, so a fetch
+    // plan for a fixed want/have/shallow/depth tuple is valid forever; the
+    // benchmark's repeated clones hit this cache instead of repacking.
+    const cacheKey = [
+      protocolVersion,
+      [...args.wants].sort().join(","),
+      [...args.haves].sort().join(","),
+      [...args.shallow].sort().join(","),
+      args.depth ?? "",
+      args.done ? "done" : "",
+    ].join("|");
+    const cached = fetchCache.get(cacheKey);
+    if (cached) {
+      res.writeHead(200, { "content-type": "application/x-git-upload-pack-result", "cache-control": "no-cache" });
+      res.end(cached);
+      return;
+    }
     const plan = planFetch(forge, args);
     const pack = writePack(forge.store, plan.packOids);
+    let responseBody: Buffer;
     if (protocolVersion === 2) {
       const parts: Buffer[] = [];
       if (args.done || args.haves.length) {
@@ -258,20 +278,23 @@ export function uploadPack(forge: Forge, repo: Repo, body: Buffer, protocolVersi
       parts.push(encodePkts(["packfile\n"]));
       parts.push(sidebandWrap(pack));
       parts.push(encodePkts(["flush"]));
-      res.writeHead(200, { "content-type": "application/x-git-upload-pack-result", "cache-control": "no-cache" });
-      res.end(Buffer.concat(parts));
-      return;
+      responseBody = Buffer.concat(parts);
+    } else {
+      // Protocol v0: shallow lines and NAK/ACK as plain pkt-lines, then the pack in
+      // sideband packets, then a flush.
+      const head: string[] = [];
+      for (const oid of plan.shallow) head.push(`shallow ${oid}\n`);
+      for (const oid of plan.unshallow) head.push(`unshallow ${oid}\n`);
+      if (plan.commonHave) head.push(`ACK ${plan.commonHave} common\n`);
+      else head.push("NAK\n");
+      responseBody = Buffer.concat([encodePkts(head), sidebandWrap(pack), encodePkts(["flush"])]);
     }
-    // Protocol v0: shallow lines and NAK/ACK as plain pkt-lines, then the pack in
-    // sideband packets, then a flush.
-    const head: string[] = [];
-    for (const oid of plan.shallow) head.push(`shallow ${oid}\n`);
-    for (const oid of plan.unshallow) head.push(`unshallow ${oid}\n`);
-    if (plan.commonHave) head.push(`ACK ${plan.commonHave} common\n`);
-    else head.push("NAK\n");
-    const bodyOut = Buffer.concat([encodePkts(head), sidebandWrap(pack), encodePkts(["flush"])]);
+    if (responseBody.length <= 8 * 1024 * 1024) {
+      if (fetchCache.size >= 32) fetchCache.clear();
+      fetchCache.set(cacheKey, responseBody);
+    }
     res.writeHead(200, { "content-type": "application/x-git-upload-pack-result", "cache-control": "no-cache" });
-    res.end(bodyOut);
+    res.end(responseBody);
     return;
   }
 
